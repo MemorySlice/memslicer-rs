@@ -6,7 +6,7 @@ resolver = "2"
 name = "memslicer"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache License 2.0"
 
 [[bin]]
 name = "memslicer"
