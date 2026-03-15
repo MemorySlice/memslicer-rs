@@ -13,7 +13,7 @@ name = "memslicer"
 path = "src/main.rs"
 
 [dependencies]
-libmsl = { path = "../libmsl", features = ["compress-all"] }
+libmsl = { git = "https://github.com/MemorySlice/libmsl", features = ["compress-all"] }
 frida = "0.17"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
