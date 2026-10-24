@@ -1,6 +1,6 @@
 pub mod agent;
 
-use super::{Backend, DeviceType, ModuleInfo, PlatformInfo, RangeInfo};
+use super::{Backend, DeviceType, ModuleInfo, PlatformInfo, RangeInfo, ThreadInfo};
 use crate::cli::Target;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -49,6 +49,35 @@ struct FridaEnrichedRange {
     #[serde(default = "default_pages_resident")]
     #[serde(rename = "pagesResident")]
     pages_resident: i64,
+}
+
+#[derive(Deserialize)]
+struct FridaThread {
+    id: u64,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    context: serde_json::Map<String, Value>,
+}
+
+impl From<FridaThread> for ThreadInfo {
+    fn from(thread: FridaThread) -> Self {
+        // Keep only string-valued registers ("0x..."); the agent already drops
+        // vector/float registers but a defensive filter costs nothing.
+        let registers = thread
+            .context
+            .into_iter()
+            .filter_map(|(name, value)| value.as_str().map(|v| (name, v.to_string())))
+            .collect();
+        ThreadInfo {
+            id: thread.id,
+            name: thread.name.unwrap_or_default(),
+            state: thread.state.unwrap_or_default(),
+            registers,
+        }
+    }
 }
 
 fn default_readable() -> bool { true }
@@ -458,6 +487,15 @@ impl Backend for FridaBackend {
             .collect();
 
         Ok(modules)
+    }
+
+    fn enumerate_threads(&mut self) -> Result<Vec<ThreadInfo>> {
+        let value = self.rpc_call_no_args("enumerateThreads")?;
+
+        let frida_threads: Vec<FridaThread> = serde_json::from_value(value)
+            .context("failed to parse enumerateThreads response")?;
+
+        Ok(frida_threads.into_iter().map(ThreadInfo::from).collect())
     }
 
     fn detach(self: Box<Self>) {

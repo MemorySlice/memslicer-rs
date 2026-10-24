@@ -5,6 +5,11 @@ mod platform;
 mod filter;
 mod progress;
 mod protection;
+mod thread_context;
+mod vas_map;
+
+#[cfg(test)]
+mod roundtrip_tests;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -41,6 +46,7 @@ fn main() -> anyhow::Result<()> {
     eprintln!("  Regions : {}/{} ({} skipped)", result.regions_captured, result.regions_total, result.regions_skipped);
     eprintln!("  Bytes   : {}", result.bytes_captured);
     eprintln!("  Modules : {}", result.modules_captured);
+    eprintln!("  Threads : {}", result.threads_captured);
     eprintln!("  Duration: {:.2}s", result.duration.as_secs_f64());
     eprintln!("  File    : {} ({} bytes)", result.output_path, file_size);
 

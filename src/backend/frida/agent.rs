@@ -20,6 +20,47 @@ function _enrichedResult(r, readable, skipReason, pagesResident) {
     };
 }
 
+// Integer flag registers Frida reports as plain numbers rather than
+// NativePointers (arm64 nzcv, arm cpsr); hex-encoded like the rest.
+var _NUMERIC_FLAG_REGISTERS = ['nzcv', 'cpsr'];
+
+// Flatten a CpuContext into {name: '0x...'}. The JSON roundtrip turns
+// NativePointers into hex strings; the numeric flag registers above are
+// hex-encoded; anything else (vector registers as ArrayBuffers, floating
+// point numbers) is dropped so the Rust side only ever sees parseable hex
+// strings.
+function _registerStrings(context) {
+    var out = {};
+    if (context === null || context === undefined) return out;
+    var plain;
+    try {
+        plain = JSON.parse(JSON.stringify(context));
+    } catch (e) {
+        return out;
+    }
+    if (plain === null || typeof plain !== 'object') return out;
+    Object.keys(plain).forEach(function(name) {
+        var value = plain[name];
+        if (typeof value === 'string') {
+            out[name] = value;
+        } else if (_NUMERIC_FLAG_REGISTERS.indexOf(name) !== -1 &&
+                   typeof value === 'number' && value >= 0 &&
+                   Math.floor(value) === value) {
+            out[name] = '0x' + value.toString(16);
+        }
+    });
+    return out;
+}
+
+function _threadResult(t) {
+    return {
+        id: t.id,
+        name: typeof t.name === 'string' ? t.name : '',
+        state: typeof t.state === 'string' ? t.state : '',
+        context: _registerStrings(t.context)
+    };
+}
+
 // -----------------------------------------------------------------------
 // Platform-specific enrichment helpers
 // -----------------------------------------------------------------------
@@ -258,6 +299,19 @@ rpc.exports = {
 
     enumerateModules: function() {
         return Process.enumerateModules();
+    },
+
+    // Threads with their register contexts; [] when the runtime cannot
+    // enumerate threads (feature-detected per frida-server version).
+    enumerateThreads: function() {
+        if (typeof Process.enumerateThreads !== 'function') return [];
+        var threads;
+        try {
+            threads = Process.enumerateThreads();
+        } catch (e) {
+            return [];
+        }
+        return threads.map(_threadResult);
     }
 };
 

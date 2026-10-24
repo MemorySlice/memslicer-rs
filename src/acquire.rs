@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
+use libmsl::constants::{CAP_MEMORY_REGIONS, CAP_MODULE_LIST, CAP_THREAD_CONTEXTS, HASH_ALGO_BLAKE3};
 use libmsl::{
-    Endianness, FileHeader, MemoryRegionPayload, ModuleEntryPayload,
-    MslWriter, PageState, RegionType,
+    ArchType, Endianness, FileHeader, MemoryRegionPayload, ModuleEntryPayload,
+    MslWriter, PageState, RegionType, ThreadContextPayload,
 };
 use crate::backend::{Backend, RangeInfo};
 use crate::cli::AcquireConfig;
@@ -14,6 +15,8 @@ use crate::filter::RegionFilter;
 use crate::platform::{detect_arch, detect_os};
 use crate::progress::ProgressUI;
 use crate::protection::parse_protection;
+use crate::thread_context::build_thread_contexts;
+use crate::vas_map::build_vas_entries;
 
 pub struct AcquireResult {
     pub regions_captured: u32,
@@ -21,6 +24,7 @@ pub struct AcquireResult {
     pub regions_skipped: u32,
     pub bytes_captured: u64,
     pub modules_captured: u32,
+    pub threads_captured: u32,
     pub aborted: bool,
     pub duration: std::time::Duration,
     pub output_path: String,
@@ -29,6 +33,7 @@ pub struct AcquireResult {
 /// Configuration for read operations, grouped to reduce parameter count.
 struct ReadConfig {
     page_size: usize,
+    page_size_log2: u8,
     max_chunk: usize,
     no_page_fallback: bool,
     max_consecutive_fail: usize,
@@ -58,22 +63,27 @@ pub fn run(mut backend: Box<dyn Backend>, config: AcquireConfig, abort: Arc<Atom
     let module_paths: Vec<&str> = modules.iter().map(|m| m.path.as_str()).collect();
     let os = detect_os(&pinfo.platform, &module_paths, config.os_override.as_deref())?;
 
-    // 4. Build file header
+    // 4. Thread register contexts (must be known before the header is written:
+    //    they decide the ThreadContexts capability bit)
+    let thread_contexts = collect_thread_contexts(&mut *backend, &config, arch, pinfo.pid)?;
+
+    // 5. Build file header (MSL 1.1: version 0x0101 is the libmsl default;
+    //    BlockCount 0 = streaming producer, the exact count goes into End-of-Capture)
     let now_ns = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos() as u64;
     let header = FileHeader {
         endianness: Endianness::Little,
-        version_major: 1,
-        version_minor: 0,
-        flags: 0,
-        cap_bitmap: 0x03, // MemoryRegions | ModuleList
+        cap_bitmap: capability_bits(!thread_contexts.is_empty()),
         dump_uuid: *uuid::Uuid::new_v4().as_bytes(),
         timestamp_ns: now_ns,
         os_type: os,
         arch_type: arch,
         pid: pinfo.pid,
+        block_count: 0,
+        hash_algo: HASH_ALGO_BLAKE3,
+        ..FileHeader::default()
     };
 
-    // 5. Output path
+    // 6. Output path
     let output_path = config.output.unwrap_or_else(|| {
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -82,12 +92,17 @@ pub fn run(mut backend: Box<dyn Backend>, config: AcquireConfig, abort: Arc<Atom
         format!("{}_{}.msl", pinfo.pid, ts)
     });
 
-    // 6. Create writer
+    // 7. Create writer
     let file = File::create(&output_path).context("failed to create output file")?;
     let buf = BufWriter::new(file);
     let mut writer = MslWriter::new(buf, &header, config.comp_algo)?;
 
-    // 7. Build filter
+    // 8. Thread Context blocks go before the first Memory Region (spec Section 6.1)
+    for thread in &thread_contexts {
+        writer.write_thread_context(thread, None)?;
+    }
+
+    // 9. Build filter
     let mut filter = RegionFilter::new();
     if let Some(ref prot_str) = config.filter_prot {
         filter.min_prot = parse_protection(prot_str);
@@ -108,15 +123,15 @@ pub fn run(mut backend: Box<dyn Backend>, config: AcquireConfig, abort: Arc<Atom
         }
     }
 
-    // 8. Enumerate and process ranges (with enrichment for pre-filtering)
+    // 10. Enumerate and process ranges (with enrichment for pre-filtering)
     eprintln!("[*] Enumerating memory ranges (with platform enrichment)...");
     let mut ranges = backend.enumerate_ranges_enriched()?;
     if debug {
         eprintln!("[debug] ranges: {} (after enumeration)", ranges.len());
     }
 
-    // 9. Volatility ordering: capture most volatile regions first
-    ranges.sort_by_cached_key(|r| volatility_key(r));
+    // 11. Volatility ordering: capture most volatile regions first
+    ranges.sort_by_cached_key(volatility_key);
     if debug {
         eprintln!("[debug] ranges sorted by volatility");
     }
@@ -124,6 +139,7 @@ pub fn run(mut backend: Box<dyn Backend>, config: AcquireConfig, abort: Arc<Atom
     let total_ranges = ranges.len() as u32;
     let rcfg = ReadConfig {
         page_size: pinfo.page_size as usize,
+        page_size_log2: page_size_log2(pinfo.page_size)?,
         max_chunk: config.max_chunk,
         no_page_fallback: config.no_page_fallback,
         max_consecutive_fail: config.max_consecutive_fail,
@@ -190,7 +206,7 @@ pub fn run(mut backend: Box<dyn Backend>, config: AcquireConfig, abort: Arc<Atom
     ui.set_progress(regions_written, bytes_captured, regions_skipped);
     ui.finish();
 
-    // 10. Write module list
+    // 12. Write module list
     let module_entries: Vec<ModuleEntryPayload> = modules
         .iter()
         .map(|m| ModuleEntryPayload {
@@ -205,10 +221,13 @@ pub fn run(mut backend: Box<dyn Backend>, config: AcquireConfig, abort: Arc<Atom
 
     writer.write_module_list(&module_entries)?;
 
-    // 11. Finalize
+    // 13. VAS Map of every enumerated range (captured or skipped), also on abort
+    writer.write_vas_map(&build_vas_entries(&ranges))?;
+
+    // 14. Finalize (writes End-of-Capture with the exact block count)
     writer.finalize()?;
 
-    // 12. Detach
+    // 15. Detach
     backend.detach();
 
     let duration = start.elapsed();
@@ -219,10 +238,55 @@ pub fn run(mut backend: Box<dyn Backend>, config: AcquireConfig, abort: Arc<Atom
         regions_skipped,
         bytes_captured,
         modules_captured: modules.len() as u32,
+        threads_captured: thread_contexts.len() as u32,
         aborted: abort.load(Ordering::Relaxed),
         duration,
         output_path,
     })
+}
+
+/// Header capability bits for the blocks this acquisition writes.
+fn capability_bits(has_thread_contexts: bool) -> u64 {
+    let mut caps = CAP_MEMORY_REGIONS | CAP_MODULE_LIST;
+    if has_thread_contexts {
+        caps |= CAP_THREAD_CONTEXTS;
+    }
+    caps
+}
+
+/// Memory Region `PageSizeLog2` for a page size that must be a power of two.
+fn page_size_log2(page_size: u32) -> Result<u8> {
+    anyhow::ensure!(
+        page_size.is_power_of_two(),
+        "page size {page_size} is not a power of two"
+    );
+    Ok(page_size.trailing_zeros() as u8)
+}
+
+/// Read every thread's registers through the backend and assemble Thread
+/// Contexts, unless `--no-registers` was given. Logs once when the agent
+/// reports no threads (Frida does so for privileged Android system apps such
+/// as `priv_app`/`platform_app`; ordinary `untrusted_app` processes work).
+fn collect_thread_contexts(
+    backend: &mut dyn Backend,
+    config: &AcquireConfig,
+    arch: ArchType,
+    pid: u32,
+) -> Result<Vec<ThreadContextPayload>> {
+    if config.no_registers {
+        return Ok(Vec::new());
+    }
+    eprintln!("[*] Enumerating threads...");
+    let threads = backend.enumerate_threads()?;
+    if threads.is_empty() {
+        eprintln!("[info] agent returned no threads; no Thread Context blocks will be written");
+        return Ok(Vec::new());
+    }
+    let contexts = build_thread_contexts(&threads, arch, pid);
+    if config.debug {
+        eprintln!("[debug] threads: {} ({} with pc and sp)", threads.len(), contexts.len());
+    }
+    Ok(contexts)
 }
 
 /// Compute volatility ordering key for a range.
@@ -250,6 +314,7 @@ fn volatility_key(range: &RangeInfo) -> (u8, u64) {
     (priority, range.base_addr)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_region(
     backend: &mut dyn Backend,
     base_addr: u64,
@@ -261,7 +326,7 @@ fn read_region(
     abort: &AtomicBool,
     ui: &mut ProgressUI,
 ) -> Result<MemoryRegionPayload> {
-    let num_pages = (size + rcfg.page_size - 1) / rcfg.page_size;
+    let num_pages = size.div_ceil(rcfg.page_size);
 
     let (page_states, page_data) = if size <= rcfg.max_chunk {
         // Small region: try full read, fallback to page-by-page
@@ -275,12 +340,12 @@ fn read_region(
             None => {
                 if rcfg.no_page_fallback {
                     if rcfg.debug {
-                        ui.log(format!("[debug]   full read failed, page fallback disabled"));
+                        ui.log("[debug]   full read failed, page fallback disabled".to_string());
                     }
                     (vec![PageState::Failed; num_pages], Vec::new())
                 } else {
                     if rcfg.debug {
-                        ui.log(format!("[debug]   full read failed, falling back to batched page read"));
+                        ui.log("[debug]   full read failed, falling back to batched page read".to_string());
                     }
                     read_pages(backend, base_addr, num_pages, rcfg, abort, ui)?
                 }
@@ -295,20 +360,20 @@ fn read_region(
         while offset < size {
             if abort.load(Ordering::Relaxed) {
                 let remaining_pages = num_pages - states.len();
-                states.extend(std::iter::repeat(PageState::Failed).take(remaining_pages));
+                states.extend(std::iter::repeat_n(PageState::Failed, remaining_pages));
                 break;
             }
 
             let chunk_size = std::cmp::min(rcfg.max_chunk, size - offset);
             let chunk_addr = base_addr + offset as u64;
-            let chunk_pages = (chunk_size + rcfg.page_size - 1) / rcfg.page_size;
+            let chunk_pages = chunk_size.div_ceil(rcfg.page_size);
 
             match backend.read_memory(chunk_addr, chunk_size)? {
                 Some(chunk_data) => {
                     if rcfg.debug {
                         ui.log(format!("[debug]   chunk 0x{:x} ok: {} bytes", chunk_addr, chunk_data.len()));
                     }
-                    states.extend(std::iter::repeat(PageState::Captured).take(chunk_pages));
+                    states.extend(std::iter::repeat_n(PageState::Captured, chunk_pages));
                     data.extend_from_slice(&chunk_data);
                     ui.set_in_progress_bytes(data.len() as u64);
                     ui.render();
@@ -318,7 +383,7 @@ fn read_region(
                         if rcfg.debug {
                             ui.log(format!("[debug]   chunk 0x{:x} failed, page fallback disabled", chunk_addr));
                         }
-                        states.extend(std::iter::repeat(PageState::Failed).take(chunk_pages));
+                        states.extend(std::iter::repeat_n(PageState::Failed, chunk_pages));
                     } else {
                         if rcfg.debug {
                             ui.log(format!("[debug]   chunk 0x{:x} failed, falling back to batched page read", chunk_addr));
@@ -347,8 +412,7 @@ fn read_region(
         region_size: size as u64,
         protection,
         region_type,
-        page_size: rcfg.page_size as u16,
-        num_pages: num_pages as u32,
+        page_size_log2: rcfg.page_size_log2,
         timestamp_ns,
         page_states,
         page_data,
@@ -373,7 +437,7 @@ fn read_pages(
     for (i, page_result) in batch_results.into_iter().enumerate() {
         if abort.load(Ordering::Relaxed) {
             let remaining = num_pages - states.len();
-            states.extend(std::iter::repeat(PageState::Failed).take(remaining));
+            states.extend(std::iter::repeat_n(PageState::Failed, remaining));
             break;
         }
 
@@ -400,7 +464,7 @@ fn read_pages(
                         ));
                     }
                     let remaining = num_pages - states.len();
-                    states.extend(std::iter::repeat(PageState::Failed).take(remaining));
+                    states.extend(std::iter::repeat_n(PageState::Failed, remaining));
                     break;
                 }
             }
@@ -410,7 +474,7 @@ fn read_pages(
     Ok((states, data))
 }
 
-fn classify_region(file_path: &str) -> RegionType {
+pub(crate) fn classify_region(file_path: &str) -> RegionType {
     if file_path.is_empty() {
         return RegionType::Anon;
     }
@@ -512,6 +576,22 @@ mod tests {
     }
 
     #[test]
+    fn test_page_size_log2() {
+        assert_eq!(page_size_log2(4096).unwrap(), 12);
+        assert_eq!(page_size_log2(16384).unwrap(), 14);
+        assert!(page_size_log2(5000).is_err());
+    }
+
+    #[test]
+    fn test_capability_bits() {
+        assert_eq!(capability_bits(false), CAP_MEMORY_REGIONS | CAP_MODULE_LIST);
+        assert_eq!(
+            capability_bits(true),
+            CAP_MEMORY_REGIONS | CAP_MODULE_LIST | CAP_THREAD_CONTEXTS
+        );
+    }
+
+    #[test]
     fn test_abort_mid_acquisition() {
         let flag = Arc::new(AtomicBool::new(true));
         assert!(flag.load(Ordering::Relaxed));
@@ -583,7 +663,7 @@ mod tests {
         ];
 
         let mut sorted = ranges;
-        sorted.sort_by_key(|r| volatility_key(r));
+        sorted.sort_by_key(volatility_key);
 
         assert_eq!(sorted[0].base_addr, 0x1000); // rw-
         assert_eq!(sorted[1].base_addr, 0x2000); // rwx

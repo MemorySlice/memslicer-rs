@@ -63,6 +63,10 @@ pub struct Args {
     /// Number of consecutive page failures before skipping remaining pages in a region (default: 16)
     #[arg(long, default_value = "16")]
     pub max_consecutive_fail: usize,
+
+    /// Do not read thread registers (no Thread Context blocks are written)
+    #[arg(long)]
+    pub no_registers: bool,
 }
 
 fn parse_comp_algo(s: &str) -> Result<CompAlgo, String> {
@@ -87,6 +91,7 @@ pub struct AcquireConfig {
     pub max_chunk: usize,
     pub no_page_fallback: bool,
     pub max_consecutive_fail: usize,
+    pub no_registers: bool,
 }
 
 /// Parse Args into AcquireConfig.
@@ -124,5 +129,6 @@ pub fn build_config(args: Args) -> anyhow::Result<AcquireConfig> {
         max_chunk: args.max_chunk,
         no_page_fallback: args.no_page_fallback,
         max_consecutive_fail: args.max_consecutive_fail,
+        no_registers: args.no_registers,
     })
 }

@@ -24,6 +24,15 @@ pub struct ModuleInfo {
     pub path: String,
 }
 
+/// A thread of the target process with the register file the backend reported.
+#[derive(Debug, Clone, Default)]
+pub struct ThreadInfo {
+    pub id: u64,
+    pub name: String,                     // empty if the backend reports none
+    pub state: String,                    // backend-specific word ("running", "waiting", ...)
+    pub registers: Vec<(String, String)>, // (name, "0x..." value) as reported, in agent order
+}
+
 /// Platform info reported by the backend.
 #[derive(Debug, Clone)]
 pub struct PlatformInfo {
@@ -65,6 +74,11 @@ pub trait Backend {
     }
     /// Enumerate loaded modules.
     fn enumerate_modules(&mut self) -> anyhow::Result<Vec<ModuleInfo>>;
+    /// Enumerate threads with their register contexts.
+    /// Default implementation reports no threads (no Thread Context blocks).
+    fn enumerate_threads(&mut self) -> anyhow::Result<Vec<ThreadInfo>> {
+        Ok(Vec::new())
+    }
     /// Detach/disconnect from the target process.
     fn detach(self: Box<Self>);
 }

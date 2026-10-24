@@ -38,6 +38,10 @@ cargo xtask build
 # or: cargo build --release
 ```
 
+For development against a local libmsl checkout, `Cargo.toml` carries a
+`[patch."https://github.com/MemorySlice/libmsl"] libmsl = { path = "../libmsl" }`
+section; drop it and run `cargo update -p libmsl` once the pinned revision is bumped.
+
 The binary will be at `target/release/memslicer`.
 
 ## Usage
@@ -88,6 +92,7 @@ The binary will be at `target/release/memslicer`.
 | `--max-chunk <BYTES>` | Max chunk size for memory reads | `2097152` (2 MB) |
 | `--no-page-fallback` | Skip page-by-page fallback on chunk failure | -- |
 | `--max-consecutive-fail <N>` | Consecutive page failures before skipping rest | `16` |
+| `--no-registers` | Do not read thread registers (no Thread Context blocks) | -- |
 
 ## Architecture
 
@@ -120,7 +125,7 @@ The binary will be at `target/release/memslicer`.
 4. **Sort by volatility** -- `rw-` first (heap/stack), then `rwx` (JIT), `r-x` (code), `r--` (data) last
 5. **Chunked read** -- Read each region in 2MB chunks; failed chunks fall back to batched page-by-page reads
 6. **Stream to MSL** -- Write each region immediately with per-page state (`Captured`/`Failed`)
-7. **Finalize** -- Write module list, close file, print summary
+7. **Finalize** -- Write module list and VAS map, close file, print summary
 
 ### Pre-filtering Heuristics
 
@@ -139,13 +144,16 @@ The binary will be at `target/release/memslicer`.
 
 MSL (Memory Slice) -- a binary format implemented in the companion [libmsl](../libmsl) crate.
 
-**File structure:**
-- **Header** -- Endianness, version, UUID, timestamp, OS, architecture, PID
+**File structure (MSL 1.1, written in this order):**
+- **Header** -- Endianness, version `0x0101`, UUID, timestamp, OS, architecture, PID
+- **Thread Context blocks** -- One per thread with its registers (pc/sp/fp/flags/tls/lr roles flagged), read live via Frida's `Process.enumerateThreads()`; disable with `--no-registers`. Frida enumerates threads for ordinary `untrusted_app` processes but returns none for privileged system apps (`priv_app`, `platform_app`); in that case none are written and a note is logged
 - **Memory region blocks** -- Per-region metadata + per-page state array + concatenated page data
 - **Module list** -- Loaded libraries/binaries with base address, size, and path
+- **VAS map** -- Every enumerated range, captured or skipped, with its live name (`NameSource` 1) so consumers can tell "not stored" from "did not exist"
+- **End-of-Capture** -- File hash and the exact block count; the header's `BlockCount` stays 0 (streaming)
 - **Integrity** -- BLAKE3 hash chain across all blocks
 
-Optional zstd or lz4 compression is applied per-block.
+Optional zstd or lz4 compression is applied per block by libmsl (whole payload behind a `UncompressedSize` prefix, spec Table 9); memslicer never compresses page data itself.
 
 ## Supported Platforms
 
@@ -163,7 +171,7 @@ Optional zstd or lz4 compression is applied per-block.
 cargo test
 ```
 
-67 unit tests covering region classification, volatility ordering, protection parsing, address/path filtering, and platform detection.
+93 unit tests covering region classification, volatility ordering, protection parsing, address/path filtering, platform detection, VAS map entries, thread-context assembly (register roles, widths, flags) and an in-memory MSL 1.1 roundtrip through libmsl's reader, including zstd- and lz4-compressed regions.
 
 ## License
 
